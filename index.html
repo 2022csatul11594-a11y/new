@@ -1,0 +1,128 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Kubeship test app</title>
+<style>
+  :root { --bg:#f6f7fb; --card:#fff; --ink:#1b1d2a; --mute:#6b7085; --line:#e4e6ef; --accent:#6d28d9; --ok:#15803d; --bad:#b91c1c; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#12131a; --card:#1b1d2a; --ink:#eceef7; --mute:#9a9fb5; --line:#2b2e42; --accent:#a78bfa; --ok:#4ade80; --bad:#f87171; } }
+  * { box-sizing: border-box; }
+  body { margin:0; font:15px/1.5 system-ui,sans-serif; background:var(--bg); color:var(--ink); }
+  main { max-width:960px; margin:0 auto; padding:24px 16px 64px; }
+  h1 { margin:0 0 4px; font-size:26px; } .sub { color:var(--mute); margin:0 0 20px; }
+  .grid { display:grid; gap:16px; grid-template-columns:repeat(auto-fit,minmax(280px,1fr)); }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:16px; }
+  .card h2 { margin:0 0 10px; font-size:16px; }
+  dl { margin:0; display:grid; grid-template-columns:auto 1fr; gap:4px 12px; } dt { color:var(--mute); } dd { margin:0; word-break:break-all; }
+  button { font:inherit; padding:7px 12px; border-radius:8px; border:1px solid var(--line); background:var(--card); color:var(--ink); cursor:pointer; }
+  button:hover { border-color:var(--accent); } button.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
+  button.danger { color:var(--bad); }
+  .row { display:flex; gap:8px; flex-wrap:wrap; margin-top:8px; }
+  input[type=text] { font:inherit; padding:7px 10px; border-radius:8px; border:1px solid var(--line); background:var(--bg); color:var(--ink); flex:1; min-width:0; }
+  ul { list-style:none; margin:12px 0 0; padding:0; } li { display:flex; gap:8px; align-items:center; padding:6px 0; border-top:1px solid var(--line); }
+  li.done span { text-decoration:line-through; color:var(--mute); } li span { flex:1; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:99px; font-size:12px; background:var(--bg); border:1px solid var(--line); }
+  pre { margin:10px 0 0; padding:10px; border-radius:8px; background:var(--bg); border:1px solid var(--line); max-height:180px; overflow:auto; font-size:12px; white-space:pre-wrap; }
+  .ok { color:var(--ok); } .bad { color:var(--bad); }
+</style>
+</head>
+<body>
+<main>
+  <h1>It works 🚀</h1>
+  <p class="sub">This test app was deployed by <b>Kubeship</b>. Use it to check health, logs, metrics, scaling and restarts.</p>
+
+  <div class="grid">
+    <section class="card">
+      <h2>About this pod</h2>
+      <dl id="info"><dt>Loading…</dt><dd></dd></dl>
+    </section>
+
+    <section class="card">
+      <h2>To-do list <span class="pill" id="persist"></span></h2>
+      <div class="row"><input type="text" id="newtodo" placeholder="Add something…" maxlength="200"><button class="primary" id="add">Add</button></div>
+      <ul id="todos"></ul>
+    </section>
+
+    <section class="card">
+      <h2>Make some noise (logs)</h2>
+      <p class="sub" style="margin:0">Then open the service's <b>Logs</b> tab in Kubeship.</p>
+      <div class="row">
+        <button data-log="info">Info line</button>
+        <button data-log="warn">Warning line</button>
+        <button data-log="error">Error line</button>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>Make some load (metrics)</h2>
+      <p class="sub" style="margin:0">Then open the <b>Metrics</b> tab.</p>
+      <div class="row">
+        <button data-get="/api/load/cpu?seconds=30">CPU for 30 s</button>
+        <button data-get="/api/load/memory?mb=100">Hold 100 MB</button>
+        <button data-get="/api/load/release">Release memory</button>
+        <button data-get="/api/slow?ms=3000">Slow request (3 s)</button>
+        <button id="burst">100 quick requests</button>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>Break it (restarts and errors)</h2>
+      <p class="sub" style="margin:0">Kubernetes should restart it after a crash.</p>
+      <div class="row">
+        <button class="danger" data-get="/api/error">Return an error (500)</button>
+        <button class="danger" id="crash">Crash the app</button>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>Last answer</h2>
+      <pre id="out">Nothing yet.</pre>
+      <div class="row"><a href="/metrics" target="_blank">/metrics</a> · <a href="/health" target="_blank">/health</a> · <a href="/api/info" target="_blank">/api/info</a></div>
+    </section>
+  </div>
+</main>
+<script>
+const $ = (s) => document.querySelector(s);
+const show = (v) => { $('#out').textContent = typeof v === 'string' ? v : JSON.stringify(v, null, 2); };
+async function call(path, opt) {
+  try { const r = await fetch(path, opt); const t = await r.text(); let b = t; try { b = JSON.parse(t); } catch {} show({ status: r.status, body: b }); return b; }
+  catch (e) { show('Request failed: ' + e.message); }
+}
+async function info() {
+  try {
+    const i = await (await fetch('/api/info')).json();
+    $('#persist').textContent = i.storage.persisted ? 'saved to disk' : 'memory only';
+    const row = (k, v) => `<dt>${k}</dt><dd>${v}</dd>`;
+    $('#info').innerHTML = row('Pod', i.pod) + row('Version', i.version) + row('Uptime', i.uptimeSeconds + ' s') +
+      row('Memory', i.memoryMb + ' MB' + (i.heldMb ? ` (holding ${i.heldMb} MB)` : '')) + row('CPUs', i.cpus) +
+      row('Port', i.port) + row('Node', i.node) + row('Public env', Object.keys(i.publicEnv).length ? JSON.stringify(i.publicEnv) : 'none set (add PUBLIC_* variables)') +
+      row('Secrets', `<span class="ok">${i.secretsHidden} other variables hidden</span>`);
+  } catch { $('#info').innerHTML = '<dt>Status</dt><dd class="bad">cannot reach the app</dd>'; }
+}
+async function list() {
+  const items = await (await fetch('/api/todos')).json();
+  $('#todos').innerHTML = items.length ? '' : '<li><span class="sub">Empty.</span></li>';
+  for (const t of items) {
+    const li = document.createElement('li'); if (t.done) li.className = 'done';
+    li.innerHTML = `<input type="checkbox" ${t.done ? 'checked' : ''}><span></span><button class="danger">✕</button>`;
+    li.querySelector('span').textContent = t.text;
+    li.querySelector('input').onchange = async (e) => { await fetch('/api/todos/' + t.id, { method: 'PATCH', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ done: e.target.checked }) }); list(); };
+    li.querySelector('button').onclick = async () => { await fetch('/api/todos/' + t.id, { method: 'DELETE' }); list(); };
+    $('#todos').appendChild(li);
+  }
+}
+$('#add').onclick = async () => {
+  const text = $('#newtodo').value.trim(); if (!text) return;
+  await fetch('/api/todos', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ text }) });
+  $('#newtodo').value = ''; list();
+};
+$('#newtodo').onkeydown = (e) => { if (e.key === 'Enter') $('#add').click(); };
+document.querySelectorAll('[data-log]').forEach((b) => b.onclick = () => call('/api/log?level=' + b.dataset.log + '&msg=' + encodeURIComponent('button: ' + b.dataset.log)));
+document.querySelectorAll('[data-get]').forEach((b) => b.onclick = async () => { await call(b.dataset.get); info(); });
+$('#burst').onclick = async () => { await Promise.all(Array.from({ length: 100 }, () => fetch('/api/info'))); show('Sent 100 requests.'); info(); };
+$('#crash').onclick = () => { if (confirm('The app will exit and Kubernetes will restart it. Continue?')) call('/api/crash'); };
+info(); list(); setInterval(info, 5000);
+</script>
+</body>
+</html>

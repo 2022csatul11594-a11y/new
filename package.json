@@ -1,0 +1,8 @@
+{
+  "name": "kubeship-test-app",
+  "version": "1.0.0",
+  "description": "A small web app and API for testing Kubeship deployments. No dependencies.",
+  "main": "server.js",
+  "scripts": { "start": "node server.js" },
+  "license": "MIT"
+}
