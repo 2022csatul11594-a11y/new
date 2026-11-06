@@ -1,0 +1,34 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Values.name }}
+  labels: { app: {{ .Values.name }}, managed-by: kubeship{{ if eq (toString .Values.sandbox) "true" }}, kubeship.io/sandbox: "true"{{ end }} }
+  {{- if eq (toString .Values.sandbox) "true" }}
+  # Read by the cluster's activator: how long the app may idle, and which
+  # databases to resume before it starts.
+  annotations:
+    kubeship.io/idle-seconds: {{ .Values.sandboxIdleSeconds | quote }}
+    {{- if .Values.sandboxDatabases }}
+    kubeship.io/databases: {{ .Values.sandboxDatabases | quote }}
+    {{- end }}
+  {{- end }}
+spec:
+  selector: { app: {{ .Values.name }} }
+  # Published on BOTH 80 and the app's real port.
+  #
+  # 80 stays first and keeps its number because the Ingress and HTTPRoute both
+  # reference it by number, and it is the convention for anything behind them.
+  # The real port is published too so an in-cluster client that uses a
+  # protocol's standard port can connect: a Temporal SDK given
+  # "temporal.eip-temporal.svc.cluster.local" with no port dials 7233 by
+  # definition, and a Service offering only 80 refused it — an address that
+  # looks correct, failing for a reason nothing surfaces.
+  #
+  # Multi-port Services require every port to be named, so both are named.
+  # Skipped when the app already listens on 80, since duplicate port numbers
+  # are rejected.
+  ports:
+    - { name: http, port: 80, targetPort: {{ .Values.port }} }
+{{- if ne (printf "%v" .Values.port) "80" }}
+    - { name: app, port: {{ .Values.port }}, targetPort: {{ .Values.port }} }
+{{- end }}

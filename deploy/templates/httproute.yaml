@@ -1,0 +1,16 @@
+{{- if and .Values.isPublic .Values.host .Values.gateway.name }}
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: {{ .Values.name }}
+  labels: { app: {{ .Values.name }}, managed-by: kubeship }
+spec:
+  parentRefs:
+    - name: {{ .Values.gateway.name }}
+      namespace: {{ .Values.gateway.namespace }}
+  hostnames: [ {{ .Values.host | quote }} ]
+  rules:
+    - backendRefs:
+        - name: {{ .Values.name }}
+          port: 80
+{{- end }}

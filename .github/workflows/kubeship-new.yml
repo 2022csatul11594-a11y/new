@@ -1,0 +1,144 @@
+# Managed by Kubeship — builds the "new" service from this repo
+# (Dockerfile) and pushes it to ECR via GitHub OIDC.
+# One file per service: other services from this repo have their own.
+name: "Kubeship · new"
+on:
+  push:
+    # Build on ANY branch — each Kubeship service tracks a branch (environment),
+    # so a push to that branch auto-builds the image it deploys.
+    branches: ['**']
+    # Order matters — a later pattern overrides an earlier one:
+    #  - any change builds…
+    #  - …except chart/config edits (deploy/**: they redeploy via ArgoCD)…
+    #  - …and Kubeship's workflow files, which are one per service: before,
+    #    writing one service's workflow (its Rebuild) built EVERY service in
+    #    the repo…
+    #  - …except THIS service's own file, so the commit that first adds it
+    #    (with deploy/**) still starts this service's first build.
+    paths:
+      - '**'
+      - '!deploy/**'
+      - '!.github/workflows/kubeship-*.yml'
+      - '.github/workflows/kubeship-new.yml'
+  workflow_dispatch: {}
+permissions:
+  id-token: write
+  contents: read
+jobs:
+  build:
+    name: "build Dockerfile"
+    # Clusters run arm64, so the image is built natively on GitHub's arm64
+    # runner (available to private repositories since 2026-01-29), not under
+    # QEMU emulation on x86 — emulation made every RUN step several times
+    # slower, and EIP's PDF-export build was cancelled at the old 15 minutes.
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      # GitHub's runner has little free disk, and the image is held twice (the
+      # local copy loaded for the scan, plus Trivy's own unpacked export). EIP's
+      # image reached ~630MB compressed and every build died "no space left on
+      # device". These preinstalled toolchains are unused here (~20GB).
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          df -h /
+      - name: Configure AWS via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::205429787317:role/kubeship-github-ecr-push
+          aws-region: ap-south-1
+      - name: Login to ECR
+        uses: aws-actions/amazon-ecr-login@v2
+      - uses: docker/setup-buildx-action@v3
+      # Kubeship build variables (managed from the portal). Public ones live as
+      # repo Variables (KSB_NEW__*) → passed as --build-arg (declare a matching
+      # ARG in your Dockerfile). Secret ones live as repo Secrets (KSB_NEW__*) →
+      # BuildKit secret files (mounted only during RUN, never baked into image
+      # layers). Prefix-based so the portal adds/removes vars without editing this.
+      - name: Materialize Kubeship build variables
+        id: ksvars
+        env:
+          KS_VARS: ${{ toJSON(vars) }}
+          KS_SECRETS: ${{ toJSON(secrets) }}
+        run: |
+          set -euo pipefail
+          mkdir -p .ksbuild-secrets
+          BUILD_ARGS=""
+          for k in $(echo "$KS_VARS" | jq -r 'keys[]'); do
+            case "$k" in
+              KSB_NEW__*)
+                name="${k#KSB_NEW__}"
+                val="$(echo "$KS_VARS" | jq -r --arg k "$k" '.[$k]')"
+                BUILD_ARGS+="$name=$val"$'\n'
+              ;;
+            esac
+          done
+          SECRET_FILES=""
+          for k in $(echo "$KS_SECRETS" | jq -r 'keys[]'); do
+            case "$k" in
+              KSB_NEW__*)
+                name="${k#KSB_NEW__}"
+                echo "$KS_SECRETS" | jq -r --arg k "$k" '.[$k]' > ".ksbuild-secrets/$name"
+                SECRET_FILES+="$name=.ksbuild-secrets/$name"$'\n'
+              ;;
+            esac
+          done
+          {
+            echo "buildargs<<KSEOF"; printf '%s' "$BUILD_ARGS"; echo "KSEOF"
+            echo "secretfiles<<KSEOF"; printf '%s' "$SECRET_FILES"; echo "KSEOF"
+          } >> "$GITHUB_OUTPUT"
+      - name: Build and push (arm64, ECR layer cache)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/arm64
+          # push to ECR AND load the built image into the runner's local Docker,
+          # so the Trivy step scans it locally (no registry pull, no extra IAM).
+          outputs: |
+            type=registry
+            type=docker
+          build-args: ${{ steps.ksvars.outputs.buildargs }}
+          secret-files: ${{ steps.ksvars.outputs.secretfiles }}
+          # Remote layer cache stored in the same ECR repo (:buildcache) — makes
+          # subsequent builds much faster. image-manifest+oci flags are
+          # required for registry cache to work with ECR.
+          cache-from: type=registry,ref=205429787317.dkr.ecr.ap-south-1.amazonaws.com/kubeship/new/new:buildcache
+          cache-to: type=registry,ref=205429787317.dkr.ecr.ap-south-1.amazonaws.com/kubeship/new/new:buildcache,mode=max,image-manifest=true,oci-mediatypes=true
+          tags: |
+            205429787317.dkr.ecr.ap-south-1.amazonaws.com/kubeship/new/new:sha-${{ github.sha }}
+            205429787317.dkr.ecr.ap-south-1.amazonaws.com/kubeship/new/new:latest
+      # Cloud-independent vulnerability scan of the built image (Trivy). Reports
+      # only — does not fail the build: exit-code '0' covers findings, and
+      # continue-on-error covers the scanner itself crashing (it once ran out of
+      # disk), which otherwise marked a build whose image was already pushed as
+      # failed, so it was never deployed. Kubeship pulls trivy.json from the
+      # run's artifacts and renders it on the service's Security tab.
+      # Cache Trivy's vulnerability DB (~40MB) across runs so it isn't re-downloaded.
+      - name: Cache Trivy DB
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/.trivycache
+          key: trivy-db-${{ github.run_id }}
+          restore-keys: trivy-db-
+      - name: Vulnerability scan (Trivy)
+        continue-on-error: true
+        uses: aquasecurity/trivy-action@v0.36.0
+        env:
+          TRIVY_CACHE_DIR: ${{ github.workspace }}/.trivycache
+        with:
+          # scans the locally-loaded image (from the build step above) — no pull
+          image-ref: 205429787317.dkr.ecr.ap-south-1.amazonaws.com/kubeship/new/new:sha-${{ github.sha }}
+          version: v0.72.0
+          format: json
+          output: trivy.json
+          scanners: vuln
+          severity: CRITICAL,HIGH,MEDIUM,LOW
+          exit-code: '0'
+      - name: Upload scan results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-results-new
+          path: trivy.json
+          retention-days: 30

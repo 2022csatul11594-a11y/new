@@ -1,0 +1,12 @@
+{{- if and (eq (toString .Values.sandbox) "true") .Values.isPublic .Values.host }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Values.name }}-wake
+  labels: { app: {{ .Values.name }}, managed-by: kubeship }
+spec:
+  type: ExternalName
+  externalName: kubeship-activator.kube-system.svc.cluster.local
+  ports:
+    - { name: http, port: 80, targetPort: 80 }
+{{- end }}

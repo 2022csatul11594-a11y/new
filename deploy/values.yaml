@@ -1,0 +1,34 @@
+name: app
+image: ""        # full ECR ref incl tag, set by Kubeship
+command: ""      # start-command override as a JSON array; "" = the image's own
+# Attached volumes as a JSON array of { claim, path }; "" = none. A JSON string
+# rather than indexed Helm parameters, for the same reason as command: indexed
+# values are positional, so detaching one would leave a stale entry behind in
+# the ArgoCD Application spec.
+volumes: ""
+port: 8080
+probeMode: tcp   # tcp (default) | http (uses healthPath) | off (no probes)
+authMode: none   # none (default) | basic — browser Basic Auth at the ingress
+healthPath: ""   # only used when probeMode=http
+replicas: 1
+stopped: false   # "true" = deliberately stopped: 0 replicas and no HPA
+sandbox: false   # "true" = sandbox: no replicas field (the activator owns it), no HPA, ingress via the activator
+sandboxIdleSeconds: ""
+sandboxDatabases: ""
+isPublic: true
+host: ""         # HTTPRoute hostname
+imagePullSecret: regcred
+envHash: ""      # changes when env vars change → triggers a rollout
+cpuRequest: 25m
+cpuLimit: ""     # empty = no CPU limit
+memRequest: 32Mi
+memLimit: 128Mi
+autoscaling: false
+nodeTargeting: ""
+minReplicas: 1
+maxReplicas: 3
+targetCpuPercent: 70
+targetMemPercent: 0
+gateway:
+  name: ""
+  namespace: ""

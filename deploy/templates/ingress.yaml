@@ -1,0 +1,59 @@
+{{- if and .Values.isPublic .Values.host (eq (default "none" .Values.authMode) "basic") }}
+# Browser-native Basic Auth in front of this service. The point is that it does
+# NOT depend on the app having a login: plenty of things Kubeship deploys have
+# none at all (Temporal's Web UI, for one) and were reachable by anyone who knew
+# the hostname. Enforced by Traefik before the request reaches a pod.
+#
+# The credential lives in the <name>-basic-auth Secret, applied straight to the
+# cluster by the control plane — never passed through here as a Helm value,
+# because that would put it in the ArgoCD Application spec and in git.
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: {{ .Values.name }}-basic-auth
+  labels: { app: {{ .Values.name }}, managed-by: kubeship }
+spec:
+  basicAuth:
+    secret: {{ .Values.name }}-basic-auth
+    removeHeader: true
+---
+{{- end }}
+{{- if and .Values.isPublic .Values.host }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ .Values.name }}
+  labels: { app: {{ .Values.name }}, managed-by: kubeship{{ if eq (toString .Values.sandbox) "true" }}, kubeship.io/sandbox: "true"{{ end }} }
+  {{- if or (eq (default "none" .Values.authMode) "basic") (eq (toString .Values.sandbox) "true") (hasSuffix ".sslip.io" .Values.host) }}
+  annotations:
+    {{- if hasSuffix ".sslip.io" .Values.host }}
+    # The free <service>.<ip>.sslip.io address gets a free Let's Encrypt certificate from the cluster's cert-manager.
+    cert-manager.io/cluster-issuer: kubeship-letsencrypt
+    {{- end }}
+    {{- if eq (default "none" .Values.authMode) "basic" }}
+    # <namespace>-<middleware>@kubernetescrd is Traefik's own reference format.
+    traefik.ingress.kubernetes.io/router.middlewares: {{ .Release.Namespace }}-{{ .Values.name }}-basic-auth@kubernetescrd
+    {{- end }}
+    {{- if eq (toString .Values.sandbox) "true" }}
+    kubeship.io/sandbox-service: {{ .Values.name | quote }}
+    {{- end }}
+  {{- end }}
+spec:
+  ingressClassName: traefik
+  {{- if hasSuffix ".sslip.io" .Values.host }}
+  tls:
+    - hosts: [{{ .Values.host | quote }}]
+      secretName: {{ .Values.name }}-tls
+  {{- end }}
+  rules:
+    - host: {{ .Values.host | quote }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                # A sandbox is reached through the activator, which wakes it.
+                name: {{ .Values.name }}{{ if eq (toString .Values.sandbox) "true" }}-wake{{ end }}
+                port: { number: 80 }
+{{- end }}

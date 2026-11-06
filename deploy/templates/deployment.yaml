@@ -1,0 +1,244 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Values.name }}
+  labels: { app: {{ .Values.name }}, managed-by: kubeship{{ if eq (toString .Values.sandbox) "true" }}, kubeship.io/sandbox: "true"{{ end }} }
+spec:
+  {{- if eq (toString .Values.stopped) "true" }}
+  # Deliberately stopped. This has to win over autoscaling, not sit beside it:
+  # while an HPA exists it owns the replica count and would immediately scale
+  # the Deployment back up to minReplicas. hpa.yaml is skipped for the same
+  # reason, so nothing is left to fight over the number.
+  replicas: 0
+  {{- else if eq (toString .Values.sandbox) "true" }}
+  # Sandbox: NO replicas field. The activator scales this Deployment to 0 when
+  # it is idle and back to 1 on the first request; a number here would make
+  # every sync fight it. (An HPA is skipped for the same reason.)
+  {{- else if not .Values.autoscaling }}
+  replicas: {{ .Values.replicas }}
+  {{- end }}
+  {{- if not .Values.volumes }}
+  # Never remove the old pod before the new one is Ready. On a compute-tier
+  # change the new pod waits on the autoscaler to provision a node, which takes
+  # 2-4 minutes and can take far longer when EC2 has no capacity in the AZ
+  # (t4g.medium was unavailable in ap-south-1a for ~18h on 2026-09-09). With
+  # the default maxUnavailable the service would be DOWN for all of it; with
+  # 0 the old pod keeps serving until its replacement genuinely works.
+  strategy:
+    rollingUpdate: { maxUnavailable: 0 }
+  {{- end }}
+  {{- if .Values.volumes }}
+  # An attached volume is ReadWriteOnce, so a rolling update DEADLOCKS: the new
+  # pod cannot attach the disk while the old one still holds it, and it sits
+  # Pending on Multi-Attach until someone works out why. Recreate takes the old
+  # pod down first, which costs a few seconds of downtime and always completes.
+  strategy: { type: Recreate }
+  {{- end }}
+  selector: { matchLabels: { app: {{ .Values.name }} } }
+  template:
+    metadata:
+      labels:
+        app: {{ .Values.name }}
+        {{- with (default "" .Values.nodeTargeting) }}
+        {{- $t := dict }}{{- if hasPrefix "b64:" . }}{{- $t = trimPrefix "b64:" . | b64dec | fromJson }}{{- else }}{{- $t = . | fromJson }}{{- end }}
+        {{- range $k, $v := $t.podLabels }}
+        {{ $k }}: {{ $v | quote }}
+        {{- end }}
+        {{- end }}
+      annotations:
+        kubeship/env-hash: {{ .Values.envHash | quote }}
+    spec:
+      # Kubernetes injects a Docker-link-style env var per Service in the
+      # namespace — <SERVICE>_PORT=tcp://<ip>:<port>, plus _SERVICE_HOST and
+      # friends. Nobody uses those, and they silently CLOBBER an app's own
+      # config when a name collides. Temporal UI died on exactly that: its
+      # service is "temporal-ui", so Kubernetes set TEMPORAL_UI_PORT to
+      # "tcp://10.245.x.x:80", which is the very variable Temporal UI reads as
+      # its listen port, and it crash-looped on
+      #   config file corrupted: cannot unmarshal !!str tcp://1... into int
+      # with nothing to suggest the platform had injected that value.
+      # Off by default here; it only exists for pre-DNS backwards compatibility.
+      enableServiceLinks: false
+      # Application pods never run on the control-plane node.
+      #
+      # A k3s server holds the API server, the scheduler, Traefik (the single
+      # ingress for EVERY service on the cluster), CoreDNS and the CNPG
+      # operator. On a worker node a memory-hungry pod degrades its neighbours;
+      # on the server it takes the whole cluster off the internet. That is not
+      # theoretical -- eip-worker (3Gi limit) was scheduled onto the server
+      # because its request no longer fitted on an agent, and on 2026-09-08 and
+      # 2026-09-09 it starved the box until nothing could execute and every
+      # client URL timed out.
+      #
+      # cluster-stack.yaml taints the server NoSchedule, which is the primary
+      # mechanism, but this is deliberately belt-and-braces: clusters
+      # provisioned before that taint existed do NOT have it (acmecorporate,
+      # 54 days old, reports TAINTS <none>), and a taint is node-side config
+      # we cannot fix without re-provisioning. The control-plane LABEL is
+      # present on every k3s server regardless, so keying off it protects old
+      # and new clusters alike.
+      #
+      # IgnoredDuringExecution: a pod already running on the server is not
+      # evicted, it relocates on its next rollout. Deliberate -- this must not
+      # turn a deploy of an unrelated service into a surprise restart.
+      {{- with (default "" .Values.nodeTargeting) }}
+      {{- /* base64 ("b64:…"): Helm's --set misparses a list of objects in a raw
+             JSON value, even with ArgoCD escaping its commas — every dedicated
+             or pinned service failed to render. Plain JSON still accepted. */}}
+      {{- $t := dict }}{{- if hasPrefix "b64:" . }}{{- $t = trimPrefix "b64:" . | b64dec | fromJson }}{{- else }}{{- $t = . | fromJson }}{{- end }}
+      # Dedicated tier. The selector stops this pod going anywhere else; the
+      # toleration lets it past the pool's taint. Both are required -- either
+      # alone is a silent misconfiguration.
+      nodeSelector:
+        {{- range $k, $v := $t.nodeSelector }}
+        {{ $k }}: {{ $v | quote }}
+        {{- end }}
+      tolerations:
+        {{- range $t.tolerations }}
+        - key: {{ .key }}
+          operator: {{ .operator }}
+          value: {{ .value | quote }}
+          effect: {{ .effect }}
+        {{- end }}
+      {{- end }}
+      affinity:
+        {{- with (default "" .Values.nodeTargeting) }}
+        # "Nothing else runs on it" -- the half a taint cannot give you. Two
+        # services on the SAME instance type both tolerate the same taint, so
+        # without this the scheduler would co-locate them. required, not
+        # preferred: preferred would co-locate them under pressure, which is
+        # precisely the guarantee being paid for.
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - topologyKey: kubernetes.io/hostname
+              labelSelector:
+                matchLabels: { kubeship.io/compute: dedicated }
+        {{- end }}
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: node-role.kubernetes.io/control-plane
+                    operator: DoesNotExist
+      {{- if .Values.imagePullSecret }}
+      imagePullSecrets: [ { name: {{ .Values.imagePullSecret }} } ]
+      {{- end }}
+      {{- with .Values.volumes }}
+      # An EBS volume mounts owned by root:root, mode 755. Most images run as a
+      # non-root user, so without this the container cannot write to its own
+      # volume — eip-worker died on "EACCES: permission denied, mkdir
+      # tmp/logs/" one second after start, six times.
+      #
+      # Any fixed GID works, and that is not a coincidence: Kubernetes chowns
+      # the volume root to fsGroup with g+rwx AND adds fsGroup to the container
+      # process's supplementary groups, whatever UID it runs as. So this makes
+      # the volume writable without needing to know the image's user.
+      #
+      # OnRootMismatch checks the root directory's ownership and skips the
+      # recursive chown when it already matches — on a large volume the default
+      # (Always) re-chowns every file on every pod start, which turns a restart
+      # into minutes of waiting.
+      securityContext:
+        fsGroup: 2000
+        fsGroupChangePolicy: OnRootMismatch
+      volumes:
+        {{- range (. | fromJsonArray) }}
+        - name: {{ .claim }}
+          persistentVolumeClaim: { claimName: {{ .claim }} }
+        {{- end }}
+      {{- end }}
+      containers:
+        - name: app
+          image: {{ .Values.image | quote }}
+          # Images are immutable sha-<commit> tags, so prefer the node cache and
+          # only pull when absent — avoids re-hitting ECR (and its token expiry)
+          # on every pod start / scale-up.
+          imagePullPolicy: IfNotPresent
+          # Start-command override. Set, it replaces BOTH the image's ENTRYPOINT
+          # and its CMD (a k8s command with no args drops the image's CMD),
+          # which is what makes "same image, different process" work: a web
+          # service and its worker can share one repo and one Dockerfile.
+          # Kubeship sends it pre-tokenized as JSON, because a shell-style split
+          # is not something a Helm template can do.
+          {{- with .Values.command }}
+          command: {{ . | fromJsonArray | toJson }}
+          {{- end }}
+          ports: [ { containerPort: {{ .Values.port }} } ]
+          # Health probes. startupProbe holds liveness/readiness off until the
+          # app is actually listening; HTTP GET when a health path is set,
+          # otherwise a TCP connect on the port (safe default for any service).
+          #
+          # The startup budget is 2s x 60 = 120 SECONDS, up from the ~60s that
+          # silently made any slow-starting image undeployable. Measured on the
+          # eip project's Temporal (temporalio/auto-setup): a COLD boot runs
+          # schema setup on two databases, namespace registration and
+          # search-attribute creation before the frontend binds its port, and
+          # exceeded 60s every time — killed mid-boot, crash-looping, with a
+          # perfectly healthy startup in its own logs and nothing but
+          # "Startup probe failed: connection refused" in the events. A WARM
+          # boot, once the schema exists, finishes well inside 60s. So the old
+          # budget failed only on first deploy, which is the worst time for it.
+          #
+          # 120s is deliberately ~2x the observed cold-boot requirement rather
+          # than a round guess. Overshooting is cheap but not free: while
+          # startupProbe runs, liveness and readiness are suspended, so a
+          # container that will NEVER listen takes that much longer to be
+          # declared failed. Readiness still gates traffic either way.
+          #
+          # TODO: make this per-service configurable. A JVM app or a large
+          # database restore can legitimately need longer, and today that needs
+          # a platform change instead of a portal field.
+          # probeMode: off | http | tcp (default). "off" emits no probes at all —
+          # Kubernetes then treats a pod as Ready the moment the container
+          # starts, so a rolling update has no gate and a broken deploy takes
+          # live traffic instead of being held back by an unready pod. That is
+          # an escape hatch for an image that cannot be probed, not a default.
+          # A sandbox is checked faster (same 120s allowance to start, ready within 2s of listening): the visitor that woke it is waiting.
+          {{- if eq (default "tcp" .Values.probeMode) "off" }}
+          # probes disabled for this service
+          {{- else if and (eq (default "tcp" .Values.probeMode) "http") .Values.healthPath }}
+          startupProbe:
+            httpGet: { path: {{ .Values.healthPath | quote }}, port: {{ .Values.port }} }
+            periodSeconds: {{ if eq (toString .Values.sandbox) "true" }}1{{ else }}2{{ end }}
+            failureThreshold: {{ if eq (toString .Values.sandbox) "true" }}120{{ else }}60{{ end }}
+          readinessProbe:
+            httpGet: { path: {{ .Values.healthPath | quote }}, port: {{ .Values.port }} }
+            periodSeconds: {{ if eq (toString .Values.sandbox) "true" }}2{{ else }}10{{ end }}
+            timeoutSeconds: 3
+          livenessProbe:
+            httpGet: { path: {{ .Values.healthPath | quote }}, port: {{ .Values.port }} }
+            periodSeconds: 15
+            timeoutSeconds: 3
+            failureThreshold: 3
+          {{- else }}
+          startupProbe:
+            tcpSocket: { port: {{ .Values.port }} }
+            periodSeconds: {{ if eq (toString .Values.sandbox) "true" }}1{{ else }}2{{ end }}
+            failureThreshold: {{ if eq (toString .Values.sandbox) "true" }}120{{ else }}60{{ end }}
+          readinessProbe:
+            tcpSocket: { port: {{ .Values.port }} }
+            periodSeconds: {{ if eq (toString .Values.sandbox) "true" }}2{{ else }}10{{ end }}
+          livenessProbe:
+            tcpSocket: { port: {{ .Values.port }} }
+            periodSeconds: 15
+            failureThreshold: 3
+          {{- end }}
+          # Env is injected from a Kubeship-managed Secret (never inline plaintext).
+          {{- with .Values.volumes }}
+          volumeMounts:
+            {{- range (. | fromJsonArray) }}
+            # The volume MASKS whatever the image ships here and starts empty —
+            # nothing is copied in. assertMountPath refuses paths the runtime
+            # needs, so this cannot hide /usr or /etc.
+            - { name: {{ .claim }}, mountPath: {{ .path | quote }} }
+            {{- end }}
+          {{- end }}
+          envFrom:
+            - secretRef: { name: {{ .Values.name }}-env, optional: true }
+          resources:
+            requests: { cpu: {{ .Values.cpuRequest }}, memory: {{ .Values.memRequest }} }
+            limits:
+              memory: {{ .Values.memLimit }}
+              {{- if .Values.cpuLimit }}
+              cpu: {{ .Values.cpuLimit }}
+              {{- end }}

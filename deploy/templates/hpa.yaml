@@ -1,0 +1,27 @@
+{{- if and .Values.autoscaling (ne (toString .Values.stopped) "true") (ne (toString .Values.sandbox) "true") }}
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ .Values.name }}
+  labels: { app: {{ .Values.name }}, managed-by: kubeship }
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ .Values.name }}
+  minReplicas: {{ .Values.minReplicas }}
+  maxReplicas: {{ .Values.maxReplicas }}
+  metrics:
+    {{- if .Values.targetCpuPercent }}
+    - type: Resource
+      resource:
+        name: cpu
+        target: { type: Utilization, averageUtilization: {{ .Values.targetCpuPercent }} }
+    {{- end }}
+    {{- if .Values.targetMemPercent }}
+    - type: Resource
+      resource:
+        name: memory
+        target: { type: Utilization, averageUtilization: {{ .Values.targetMemPercent }} }
+    {{- end }}
+{{- end }}
